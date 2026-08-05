@@ -59,6 +59,14 @@ from gateway.platforms.base import (
 )
 from gateway.config import Platform
 
+# Multiplex-safe credential resolution. In multiplex mode (multiplex_profiles:
+# true) each profile's BUZZ_PRIVATE_KEY lives in the per-profile secret scope,
+# NOT in os.environ (which only ever carries the default profile's key, loaded
+# once at gateway start). Reading os.getenv here collapses every worker onto
+# the default identity. Mirror Slack's adapter: prefer get_secret (returns the
+# active profile's key, fails closed in multiplex).
+from agent.secret_scope import UnscopedSecretError, get_secret
+
 
 # Buzz chat messages are Nostr kind 9 events.  ``buzz messages get`` also
 # returns housekeeping kinds (joins, canvas updates, …) — only kind 9 is
@@ -222,10 +230,24 @@ def _resolve_cli_path(configured: str = "") -> str:
 
 
 def _resolve_private_key(extra: Optional[dict] = None) -> str:
-    """Resolve the Nostr private key: env first, then a credentials JSON.
+    """Resolve the Nostr private key.
+
+    Prefers the per-profile secret scope (multiplex-safe), then falls back to
+    the process environment and a credentials JSON.
 
     NEVER log the return value.
     """
+    # Per-profile scope first — this is what separates worker identities in
+    # multiplex mode. Fails closed (UnscopedSecretError / None) rather than
+    # leaking whichever profile's key happens to sit in os.environ.
+    try:
+        key = (get_secret("BUZZ_PRIVATE_KEY") or "").strip()
+    except UnscopedSecretError:
+        key = ""
+    if key:
+        return key
+    # Legacy fallbacks for single-profile deployments that provide the key via
+    # the process environment or a credentials file.
     key = os.getenv("BUZZ_PRIVATE_KEY", "").strip()
     if key:
         return key
