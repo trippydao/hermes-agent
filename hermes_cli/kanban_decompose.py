@@ -45,6 +45,8 @@ from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_cli.kanban_models import UNKNOWN as _LIVE_UNKNOWN
+from hermes_cli.kanban_models import enumerate_live_models as _enumerate_live_models
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +136,10 @@ class DecomposeOutcome:
     fanout: bool = False
     child_ids: list[str] | None = None
     new_title: Optional[str] = None
+    # Resolved liveness-ignore settings (gh-78). Populated by decompose_task
+    # so callers and the child-validation pass can see which endpoints were
+    # opted out of the live-model probe.
+    liveness_ignore: Optional[LivenessIgnore] = None
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -212,6 +218,167 @@ def _resolve_default_assignee(cfg: dict) -> str:
         return profiles_mod.get_active_profile_name() or "default"
     except Exception:
         return "default"
+
+
+@dataclass(frozen=True)
+class LivenessIgnore:
+    """Config-driven opt-out for the decompose liveness check (gh-78).
+
+    ``ignore_all`` (``kanban.decompose_ignore_liveness``) disables the
+    live-model probe entirely — decomposition always proceeds, matching
+    pre-feature behavior. ``ignored_base_urls``
+    (``kanban.decompose_ignore_liveness_base_urls``) opts specific
+    endpoints out: their models are treated as live without probing.
+    """
+
+    ignore_all: bool = False
+    ignored_base_urls: frozenset[str] = frozenset()
+
+    def ignores(self, base_url: str) -> bool:
+        """True when ``base_url`` should skip the liveness probe."""
+        if self.ignore_all:
+            return True
+        return base_url in self.ignored_base_urls
+
+
+def _resolve_liveness_ignore(cfg: dict) -> LivenessIgnore:
+    """Read the decompose liveness-ignore knobs from ``kanban`` config.
+
+    Returns a :class:`LivenessIgnore` describing which endpoints (if any)
+    should skip the live-model probe. Never raises: malformed config
+    degrades to the default (probe everything).
+    """
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    ignore_all = bool(kanban_cfg.get("decompose_ignore_liveness", False))
+    raw_urls = kanban_cfg.get("decompose_ignore_liveness_base_urls") or []
+    if not isinstance(raw_urls, list):
+        raw_urls = []
+    urls = frozenset(
+        str(u).strip().rstrip("/")
+        for u in raw_urls
+        if isinstance(u, str) and u.strip()
+    )
+    return LivenessIgnore(ignore_all=ignore_all, ignored_base_urls=urls)
+
+
+def _profile_model_and_base_urls(assignee: str) -> tuple[Optional[str], list[str]]:
+    """Read an assignee profile's own config for ``(model, base_urls)``.
+
+    ``model`` mirrors :func:`hermes_cli.profiles._read_config_model` (the
+    ``model.default`` / ``model.model`` scalar) — the model a worker for this
+    profile would actually run. ``base_urls`` are the profile's own
+    custom-provider endpoints (canonical, trailing-slash-stripped). Reads the
+    profile's ``config.yaml`` raw so a long-lived decomposer never flips
+    ``HERMES_HOME`` to visit a named profile.
+
+    Fail-soft: any read/config error degrades to ``(None, [])`` — the caller
+    treats that as "cannot verify", which flags rather than drops the leg.
+    """
+    try:
+        pdir = profiles_mod.get_profile_dir(assignee)
+        from hermes_cli.config import get_compatible_custom_providers, read_user_config_raw
+        cfg = read_user_config_raw(pdir / "config.yaml")
+    except Exception:
+        return None, []
+    if not isinstance(cfg, dict):
+        return None, []
+    model: Optional[str] = None
+    model_cfg = cfg.get("model", {})
+    if isinstance(model_cfg, str):
+        model = model_cfg.strip() or None
+    elif isinstance(model_cfg, dict):
+        raw = model_cfg.get("default") or model_cfg.get("model")
+        if isinstance(raw, str):
+            model = raw.strip() or None
+    base_urls: list[str] = []
+    try:
+        for entry in get_compatible_custom_providers(cfg) or []:
+            if not isinstance(entry, dict):
+                continue
+            bu = str(entry.get("base_url", "") or "").strip().rstrip("/")
+            if bu and bu not in base_urls:
+                base_urls.append(bu)
+    except Exception:
+        pass
+    return model, base_urls
+
+
+def _liveness_verdict(
+    model: Optional[str],
+    base_urls: list[str],
+    live_map: dict,
+    liveness_ignore: LivenessIgnore,
+) -> tuple[str, str]:
+    """Decide ``('pass'|'flag'|'skip', reason)`` for one decomposition leg.
+
+    * ``'pass'`` — the model is served by at least one assignee endpoint, or
+      that endpoint is explicitly opted out of probing via
+      ``decompose_ignore_liveness_base_urls`` (treated as live).
+    * ``'skip'`` — every known assignee endpoint serves models but NOT this
+      one: a worker would spawn against a model the runtime doesn't serve, so
+      the leg must not be emitted.
+    * ``'flag'`` — cannot verify (no endpoint or no model configured, or the
+      only endpoints are UNKNOWN / the probe never ran). Fail-soft: keep the
+      leg but annotate it as unverified.
+    """
+    if liveness_ignore.ignore_all:
+        return "pass", ""
+    if not base_urls:
+        return "flag", "assignee declares no custom-provider endpoint to verify against"
+    if not model:
+        return "flag", "assignee has no configured model to verify"
+    served_by_known = False
+    unknown_endpoints: list[str] = []
+    known_endpoints: list[str] = []
+    for bu in base_urls:
+        if liveness_ignore.ignores(bu):
+            served_by_known = True  # explicit opt-out: treat as live, no probe
+            continue
+        state = live_map.get(bu, _LIVE_UNKNOWN)
+        if state is _LIVE_UNKNOWN:
+            unknown_endpoints.append(bu)
+            continue
+        known_endpoints.append(bu)
+        if model in state:
+            served_by_known = True
+    if served_by_known:
+        return "pass", ""
+    if unknown_endpoints:
+        return "flag", f"endpoint(s) UNKNOWN, liveness unverified (fail-soft): {', '.join(unknown_endpoints)}"
+    return "skip", f"model {model!r} not served by {', '.join(known_endpoints) or 'no endpoints'}"
+
+
+def _annotate_liveness(
+    task_id: str,
+    skipped: list[tuple[int, str, str]],
+    flagged: list[tuple[int, str, str]],
+    *,
+    author: str,
+) -> None:
+    """Post one comment on the parent task summarizing the liveness gate.
+
+    Runs best-effort after the fan-out so the root's history records that
+    legs were withheld (or left unverified) — a human should not have to infer
+    it from the child list being shorter than the LLM intended. Never raises:
+    a comment is diagnostic, not load-bearing.
+    """
+    lines: list[str] = []
+    if skipped:
+        lines.append("Skipped by decompose liveness gate (model not served by assignee endpoint):")
+        for idx, title, reason in skipped:
+            lines.append(f"- [{idx}] {title}: {reason}")
+    if flagged:
+        lines.append("Kept but UNVERIFIED (fail-soft — endpoint/model could not be confirmed):")
+        for idx, title, reason in flagged:
+            lines.append(f"- [{idx}] {title}: {reason}")
+    body = "\n".join(lines)
+    if not body:
+        return
+    try:
+        with kb.connect_closing() as conn:
+            kb.add_comment(conn, task_id, author, body)
+    except Exception as exc:
+        logger.warning("decompose: failed to annotate parent %s: %s", task_id, exc)
 
 
 def _build_roster() -> tuple[list[dict], set[str]]:
@@ -302,6 +469,12 @@ def decompose_task(
         )
 
     cfg = _load_config()
+    # Liveness-ignore knob (gh-78): read once so the child-validation pass
+    # (and any caller inspecting the outcome) can consult it. When
+    # decompose_ignore_liveness is true, or a child's endpoint is in
+    # decompose_ignore_liveness_base_urls, the live-model probe is skipped
+    # for that leg.
+    liveness_ignore = _resolve_liveness_ignore(cfg)
     orchestrator = _resolve_orchestrator_profile(cfg)
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
@@ -389,6 +562,7 @@ def decompose_task(
         return DecomposeOutcome(
             task_id, True, "single task (no fanout)",
             fanout=False, new_title=title_val,
+            liveness_ignore=liveness_ignore,
         )
 
     raw_tasks = parsed.get("tasks") or []
@@ -441,13 +615,69 @@ def decompose_task(
             "parents": clean_parents,
         })
 
+    # ------------------------------------------------------------------
+    # Liveness gate (gh-78): only emit legs whose worker model is actually
+    # served. Probe the live model inventory once, then for each child
+    # resolve its assignee profile's endpoint + model and drop legs whose
+    # model is definitively absent — a worker would spawn against a model
+    # the runtime doesn't serve. Legs we cannot verify (UNKNOWN endpoint,
+    # no endpoint, no model) are kept but FLAGGED (fail-soft: a down probe
+    # must never abort wiring work). Parent indices are remapped to the
+    # surviving legs so a child whose prerequisite was dropped becomes a
+    # parallel leaf instead of a dangling reference. The whole pass is
+    # skipped when the decompose_ignore_liveness knob disables it.
+    # ------------------------------------------------------------------
+    skipped: list[tuple[int, str, str]] = []
+    flagged: list[tuple[int, str, str]] = []
+    if liveness_ignore.ignore_all or not children:
+        survivors = children
+    else:
+        try:
+            live_map = _enumerate_live_models()
+        except Exception as exc:
+            # Probe infrastructure down: fail soft — keep everything, flag.
+            logger.warning("decompose: liveness probe unavailable for %s (%s)", task_id, exc)
+            live_map = {}
+        survivors = []
+        keep_orig: list[int] = []
+        for orig_idx, child in enumerate(children):
+            model, base_urls = _profile_model_and_base_urls(child["assignee"])
+            action, reason = _liveness_verdict(model, base_urls, live_map, liveness_ignore)
+            title = child["title"]
+            if action == "skip":
+                skipped.append((orig_idx, title, reason))
+                logger.info("decompose: liveness gate drops leg %d (%r): %s", orig_idx, title, reason)
+                continue
+            survivors.append(child)
+            keep_orig.append(orig_idx)
+            if action == "flag":
+                flagged.append((orig_idx, title, reason))
+        old_to_new = {orig: new for new, orig in enumerate(keep_orig)}
+        for child in survivors:
+            child["parents"] = [old_to_new[p] for p in child.get("parents", []) if p in old_to_new]
+
+    # Record what the gate withheld/left unverified on the parent, so the
+    # root's history explains a child list that is shorter than intended.
+    if skipped or flagged:
+        _annotate_liveness(task_id, skipped, flagged, author=audit_author)
+
+    # Every leg was dropped: nothing to emit and no graph to write. Leave the
+    # root in triage so it surfaces for a human (or a fresh decompose after
+    # the models are back) rather than silently vanishing.
+    if not survivors:
+        return DecomposeOutcome(
+            task_id, False,
+            f"decomposed into 0 children — every leg skipped by liveness gate "
+            f"({len(skipped)} skipped, {len(flagged)} unverified)",
+        )
+
     try:
         with kb.connect_closing() as conn:
             child_ids = kb.decompose_triage_task(
                 conn,
                 task_id,
                 root_assignee=orchestrator,
-                children=children,
+                children=survivors,
                 author=audit_author,
                 auto_promote=auto_promote,
             )
@@ -465,6 +695,7 @@ def decompose_task(
     return DecomposeOutcome(
         task_id, True, f"decomposed into {len(child_ids)} children",
         fanout=True, child_ids=child_ids,
+        liveness_ignore=liveness_ignore,
     )
 
 
