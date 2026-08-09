@@ -273,6 +273,7 @@ def decompose_task(
     *,
     author: Optional[str] = None,
     timeout: Optional[int] = None,
+    auto_promote: Optional[bool] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -280,6 +281,16 @@ def decompose_task(
     expected failure modes (task not in triage, no aux client
     configured, API error, malformed response, decomposer returned
     fanout=true with empty task list) — those surface via ``ok=False``.
+
+    ``auto_promote``:
+        - ``None`` — read ``kanban.auto_promote_children`` (default True).
+          Children move straight to ``ready`` and the dispatcher runs them.
+        - ``False`` — children stay in ``todo`` (held for manual
+          review/release). Used by the approval-gated auto-decompose
+          path (``kanban.auto_decompose_require_approval``) so an
+          unsupervised fan-out never spawns workers until a human
+          ``hermes kanban approve`` them.
+        - ``True`` — force immediate promotion regardless of config.
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
@@ -294,7 +305,8 @@ def decompose_task(
     orchestrator = _resolve_orchestrator_profile(cfg)
     default_assignee = _resolve_default_assignee(cfg)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
+    if auto_promote is None:
+        auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
     roster, valid_names = _build_roster()
 
     try:
