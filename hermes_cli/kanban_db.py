@@ -99,7 +99,7 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {"triage", "todo", "scheduled", "needs_approval", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -5837,11 +5837,13 @@ def promote_task(
     force: bool = False,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Manually promote a `todo` or `blocked` task to `ready`.
+    """Manually promote a `todo`, `blocked`, or `needs_approval` task to `ready`.
 
     Mirrors the automatic promotion done by ``recompute_ready`` but
     drives it from a deliberate operator action with an audit-trail
-    entry. Refuses to promote if any parent dep is not in a terminal
+    entry — and is the backend for ``hermes kanban approve``, which
+    releases approval-gated (``needs_approval``) tasks so workers may
+    run. Refuses to promote if any parent dep is not in a terminal
     state (`done`/`archived`) unless ``force=True``. Does NOT change
     assignee or claim state. Returns ``(True, None)`` on success and
     ``(False, reason)`` if refused. ``dry_run=True`` validates the
@@ -5854,10 +5856,10 @@ def promote_task(
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in ("todo", "blocked", "needs_approval"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked' or 'needs_approval'"
         )
 
     if not force:
@@ -5883,7 +5885,7 @@ def promote_task(
     with write_txn(conn):
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')",
+            "WHERE id = ? AND status IN ('todo', 'blocked', 'needs_approval')",
             (task_id,),
         )
         if upd.rowcount != 1:
@@ -5972,23 +5974,30 @@ def specify_triage_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     author: Optional[str] = None,
+    status: str = "todo",
 ) -> bool:
     """Flesh out a triage task and promote it to ``todo``.
 
     Atomically updates ``title`` / ``body`` / ``assignee`` (when provided)
-    and transitions ``status: triage -> todo`` in a single write txn. Returns
-    False when the task is missing or not in the ``triage`` column — callers
-    should surface that as "nothing to specify" rather than an error.
+    and transitions ``status: triage -> <status>`` in a single write txn.
+    Returns False when the task is missing or not in the ``triage``
+    column — callers should surface that as "nothing to specify" rather
+    than an error.
 
-    ``todo`` (not ``ready``) is the correct landing column: ``recompute_ready``
-    promotes parent-free / parent-done todos to ``ready`` on the next
-    dispatcher tick, which keeps the normal parent-gating behaviour intact
-    for specified tasks that happen to have open parents.
+    ``status`` defaults to ``todo`` — the normal landing column:
+    ``recompute_ready`` promotes parent-free / parent-done todos to
+    ``ready`` on the next dispatcher tick, which keeps the normal
+    parent-gating behaviour intact for specified tasks that happen to
+    have open parents. The approval-gated auto-decompose path passes
+    ``status="needs_approval"`` so even a single-task fan-out (no
+    children) holds until a human ``hermes kanban approve`` releases it.
 
     ``author`` is recorded on an audit comment only when at least one of
     ``title`` / ``body`` / ``assignee`` actually changed — avoids noisy
     comment spam for status-only promotions.
     """
+    if status not in VALID_STATUSES:
+        raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
@@ -5999,8 +6008,8 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        sets: list[str] = ["status = 'todo'"]
-        params: list[Any] = []
+        sets: list[str] = [f"status = ?"]
+        params: list[Any] = [status]
         changed_fields: list[str] = []
         if title is not None and title.strip() != (existing["title"] or ""):
             sets.append("title = ?")
@@ -6063,6 +6072,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    child_status: str = "todo",
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -6086,10 +6096,19 @@ def decompose_triage_task(
       - The root task is not in ``triage``
       - A cycle would result (caller built a bad graph)
 
+    ``child_status`` controls the initial status of created children.
+    Default ``"todo"`` (normal flow — parent-free children are promoted
+    to ``ready`` by ``recompute_ready`` when ``auto_promote`` is true).
+    The approval-gated auto-decompose path passes
+    ``child_status="needs_approval"`` so no child is ever auto-promoted;
+    each holds until a human ``hermes kanban approve`` releases it.
+
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
     """
+    if child_status not in VALID_STATUSES:
+        raise ValueError(f"child_status must be one of {sorted(VALID_STATUSES)}")
     if not children:
         return None
     if root_assignee is not None:
@@ -6164,10 +6183,13 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
-        # Create children. Status is 'todo' regardless of parents — we
-        # link them under the root AFTER creation so the dispatcher
-        # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        # Create children. Status is the caller-chosen default
+        # ('todo' normally, 'needs_approval' for the approval-gated
+        # path) regardless of parents — we link them under the root
+        # AFTER creation so the dispatcher sees a coherent state, and
+        # recompute_ready() (when auto_promote) promotes parent-free
+        # 'todo' children to 'ready'. 'needs_approval' children are
+        # never auto-promoted by recompute_ready.
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
@@ -6198,12 +6220,13 @@ def decompose_triage_task(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    child_status,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
@@ -6281,8 +6304,9 @@ def decompose_triage_task(
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
-    # stay in 'todo' until the user manually promotes them — useful
-    # for manual-review-first workflows.
+    # stay in their created status until the user manually promotes
+    # them (e.g. 'needs_approval' children wait for `hermes kanban
+    # approve`) — useful for manual-review-first workflows.
     if auto_promote:
         recompute_ready(conn)
     return child_ids

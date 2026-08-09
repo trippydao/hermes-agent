@@ -1378,10 +1378,11 @@ class GatewayKanbanWatchersMixin:
             boards. Returns the number of triage tasks that were
             successfully decomposed or specified this tick.
 
-            When ``require_approval`` is True, decomposed children are held
-            in ``todo`` (``auto_promote=False``) instead of being launched —
-            the human-in-the-loop gate. The graph is built, but no worker
-            spawns until ``hermes kanban approve`` releases it.
+            When ``require_approval`` is True, decomposed children land in
+            a real ``needs_approval`` status (holding every child) instead
+            of being launched — the human-in-the-loop gate. The graph is
+            built, but no worker spawns until ``hermes kanban approve``
+            releases it.
             """
             try:
                 from hermes_cli import kanban_decompose as _decomp
@@ -1422,7 +1423,7 @@ class GatewayKanbanWatchersMixin:
                         try:
                             outcome = _decomp.decompose_task(
                                 tid, author="auto-decomposer",
-                                auto_promote=not require_approval,
+                                approval_hold=require_approval,
                             )
                         except Exception:
                             logger.exception(

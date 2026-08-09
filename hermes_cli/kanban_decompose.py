@@ -274,6 +274,7 @@ def decompose_task(
     author: Optional[str] = None,
     timeout: Optional[int] = None,
     auto_promote: Optional[bool] = None,
+    approval_hold: bool = False,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks.
 
@@ -286,11 +287,18 @@ def decompose_task(
         - ``None`` — read ``kanban.auto_promote_children`` (default True).
           Children move straight to ``ready`` and the dispatcher runs them.
         - ``False`` — children stay in ``todo`` (held for manual
-          review/release). Used by the approval-gated auto-decompose
-          path (``kanban.auto_decompose_require_approval``) so an
-          unsupervised fan-out never spawns workers until a human
-          ``hermes kanban approve`` them.
+          review/release).
         - ``True`` — force immediate promotion regardless of config.
+
+    ``approval_hold``:
+        When True (used by the auto-decompose path when
+        ``kanban.auto_decompose_require_approval`` is set), children land
+        in a real ``needs_approval`` status — distinct from the generic
+        manual-review ``todo`` hold — and no worker is spawned until a
+        human runs ``hermes kanban approve <id>`` (an alias of promote,
+        which releases ``needs_approval`` -> ``ready``). Applies to both
+        fan-out children and the single-task (no-fanout) fallback.
+        ``auto_promote`` is forced off while in approval hold.
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
@@ -307,6 +315,9 @@ def decompose_task(
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     if auto_promote is None:
         auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
+    if approval_hold:
+        auto_promote = False
+    child_status = "needs_approval" if approval_hold else "todo"
     roster, valid_names = _build_roster()
 
     try:
@@ -381,6 +392,7 @@ def decompose_task(
                 body=body_val,
                 assignee=assignee_val,
                 author=audit_author,
+                status=child_status,
             )
         if not ok:
             return DecomposeOutcome(
@@ -450,6 +462,7 @@ def decompose_task(
                 children=children,
                 author=audit_author,
                 auto_promote=auto_promote,
+                child_status=child_status,
             )
     except ValueError as exc:
         return DecomposeOutcome(task_id, False, f"DB rejected graph: {exc}")

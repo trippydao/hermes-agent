@@ -114,11 +114,13 @@ def test_decompose_with_fanout_creates_children(kanban_home):
 
 
 def test_decompose_auto_promote_false_holds_children_in_todo(kanban_home):
-    # Human-in-the-loop gate (#76): with auto_promote=False the decomposer
-    # builds the child graph but leaves parent-free children in 'todo' so no
-    # worker spawns until a human 'hermes kanban approve' releases them.
+    # Generic manual-review hold: auto_promote=False (without the
+    # approval_hold flag, the approval gate is off) leaves children in
+    # 'todo' — no worker spawns until a human promotes them. Distinct
+    # from the approval-gated 'needs_approval' hold which has its own
+    # state; see test_decompose_approval_hold_* below.
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="approval-gated fanout", triage=True)
+        tid = kb.create_task(conn, title="manual-review fanout", triage=True)
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -235,5 +237,116 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
             p.stop()
     assert outcome.ok is False
     assert "not in triage" in outcome.reason
+
+
+def test_decompose_approval_hold_lands_children_in_needs_approval(kanban_home):
+    # Approval gate (#76): with approval_hold=True the decomposer builds
+    # the child graph but lands EVERY child in a real 'needs_approval'
+    # state — distinct from 'todo' — so no worker spawns until a human
+    # 'hermes kanban approve' releases the task.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="approval-gated fanout", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "approval-gated test",
+        "tasks": [
+            {"title": "first", "body": "a", "assignee": "researcher", "parents": []},
+            {"title": "second", "body": "b", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"auto_promote_children": True}},
+        ):
+            # approval_hold forces auto_promote off regardless of config.
+            outcome = decomp.decompose_task(
+                tid, author="auto-decomposer", approval_hold=True,
+            )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+
+    with kb.connect() as conn:
+        c0 = kb.get_task(conn, outcome.child_ids[0])
+        c1 = kb.get_task(conn, outcome.child_ids[1])
+    assert c0 is not None and c1 is not None
+    # EVERY child holds in needs_approval — parent-free ones would
+    # normally be 'ready'; the approval gate overrides that.
+    assert c0.status == "needs_approval", c0.status
+    assert c1.status == "needs_approval", c1.status
+
+
+def test_decompose_approval_hold_releases_via_promote(kanban_home):
+    # Accept: hermes kanban approve is an alias of promote, so releasing
+    # a 'needs_approval' task must put it in 'ready' and let workers run.
+    # Set up state without the LLM: create a triage task, decompose it
+    # by hand through the DB helper with child_status='needs_approval'.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="approval-gated single", triage=True)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            children=[
+                {"title": "research", "body": "look", "assignee": "researcher", "parents": []},
+            ],
+            author="auto-decomposer",
+            auto_promote=False,
+            child_status="needs_approval",
+        )
+    assert child_ids is not None
+    child_id = child_ids[0]
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, child_id).status == "needs_approval"
+        ok, err = kb.promote_task(conn, child_id, actor="je")
+        assert ok, err
+        assert kb.get_task(conn, child_id).status == "ready"
+
+
+def test_decompose_approval_hold_single_task_no_fanout(kanban_home):
+    # Approval gate on the single-task (fanout=false) fallback: the
+    # tightened task must hold in 'needs_approval', not auto-run.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="single unit", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "single unit",
+        "title": "Tightened title",
+        "body": "One concrete worker spec.",
+        "assignee": "researcher",
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"auto_promote_children": True}},
+        ):
+            outcome = decomp.decompose_task(
+                tid, author="auto-decomposer", approval_hold=True,
+            )
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is False
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.status == "needs_approval", task.status
 
 
