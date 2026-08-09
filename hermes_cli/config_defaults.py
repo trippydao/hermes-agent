@@ -2370,6 +2370,12 @@ DEFAULT_CONFIG = {
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.
         "auto_decompose_per_tick": 3,
+        # Human-in-the-loop gate for auto-decompose. When true, the
+        # decomposer still builds the child graph but holds every child in
+        # 'todo' (auto_promote=False) — no worker spawns until a human runs
+        # `hermes kanban approve <id>` (alias of promote). Default false:
+        # auto-decompose behaves as before (decompose -> ready -> run).
+        "auto_decompose_require_approval": False,
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The

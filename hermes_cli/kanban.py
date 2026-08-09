@@ -688,6 +688,43 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit machine-readable JSON result",
     )
 
+    # `approve` is a semantic alias of `promote` used to release
+    # approval-gated auto-decomposed children (kanban.auto_decompose_
+    # require_approval). Same parser, same handler — the name makes the
+    # human-in-the-loop intent explicit at the CLI.
+    p_approve = sub.add_parser(
+        "approve",
+        help="Release approval-gated (held) tasks so workers may run (alias of promote)",
+    )
+    p_approve.add_argument("task_id")
+    p_approve.add_argument(
+        "reason",
+        nargs="*",
+        help="Audit-trail reason (recorded on the task_events row)",
+    )
+    p_approve.add_argument(
+        "--ids",
+        nargs="+",
+        default=None,
+        help="Additional task ids to approve with the same reason (bulk mode)",
+    )
+    p_approve.add_argument(
+        "--force",
+        action="store_true",
+        help="Approve even if parent dependencies are not yet done/archived",
+    )
+    p_approve.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate the approval without mutating state",
+    )
+    p_approve.add_argument(
+        "--json",
+        dest="json",
+        action="store_true",
+        help="Emit machine-readable JSON result",
+    )
+
     p_archive = sub.add_parser("archive", help="Archive one or more tasks")
     p_archive.add_argument("task_ids", nargs="*",
                            help="Task ids to archive (default mode)")
@@ -1067,6 +1104,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
+            "approve":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
@@ -1132,6 +1170,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "schedule",
     "unblock",
     "promote",
+    "approve",
     "archive",
     "dispatch",
     "daemon",

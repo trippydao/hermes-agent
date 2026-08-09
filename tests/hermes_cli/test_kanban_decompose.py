@@ -113,6 +113,82 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decompose_auto_promote_false_holds_children_in_todo(kanban_home):
+    # Human-in-the-loop gate (#76): with auto_promote=False the decomposer
+    # builds the child graph but leaves parent-free children in 'todo' so no
+    # worker spawns until a human 'hermes kanban approve' releases them.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="approval-gated fanout", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "approval-gated test",
+        "tasks": [
+            {"title": "first", "body": "a", "assignee": "researcher", "parents": []},
+            {"title": "second", "body": "b", "assignee": "engineer", "parents": [0]},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"auto_promote_children": True}},
+        ):
+            # Explicit auto_promote=False overrides the config default True.
+            outcome = decomp.decompose_task(tid, author="auto-decomposer", auto_promote=False)
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.fanout is True
+
+    with kb.connect() as conn:
+        c0 = kb.get_task(conn, outcome.child_ids[0])
+        c1 = kb.get_task(conn, outcome.child_ids[1])
+    assert c0 is not None and c1 is not None
+    # Parent-free child would normally be 'ready'; approval gate holds it.
+    assert c0.status == "todo", c0.status
+    assert c1.status == "todo", c1.status
+
+
+def test_decompose_auto_promote_none_uses_config(kanban_home):
+    # Default path (auto_promote not passed) should honour auto_promote_children.
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="config-default fanout", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "config-default test",
+        "tasks": [
+            {"title": "only", "body": "a", "assignee": "researcher", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["orchestrator", "researcher"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={"kanban": {"auto_promote_children": False}},
+        ):
+            # No override -> honours config False -> still held in todo.
+            outcome = decomp.decompose_task(tid, author="auto-decomposer")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        c0 = kb.get_task(conn, outcome.child_ids[0])
+    assert c0 is not None
+    assert c0.status == "todo", c0.status
+
+
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="route me safely", triage=True)
