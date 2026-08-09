@@ -1327,6 +1327,11 @@ def _normalize_custom_provider_entry(
         "request_timeout_seconds", "stale_timeout_seconds",
         "discover_models", "extra_body", "extra_headers",
         "ssl_ca_cert", "ssl_verify",
+        # Per-provider output cap. Accepted under either name so a provider
+        # block can pin its own response ceiling, propagated onto the resolved
+        # runtime dict and AIAgent.max_tokens when the global
+        # ``model.max_tokens`` isn't set (see _lift_max_output_tokens).
+        "max_output_tokens", "max_tokens",
     }
     for camel, snake in _CAMEL_ALIASES.items():
         if camel in entry and snake not in entry:
@@ -1449,6 +1454,17 @@ def _normalize_custom_provider_entry(
     discover_models = entry.get("discover_models")
     if isinstance(discover_models, bool):
         normalized["discover_models"] = discover_models
+
+    # Per-provider output cap. Prefer the explicit ``max_output_tokens``
+    # spelling, fall back to the OpenAI-style ``max_tokens`` alias. Kept on
+    # the normalized entry so _lift_max_output_tokens and the runtime
+    # resolver can propagate it to AIAgent.max_tokens at request time
+    # (gh-55 layer 1 — prevent requests exceeding the Spark 131072 ceiling).
+    _provider_output_cap = entry.get("max_output_tokens")
+    if not isinstance(_provider_output_cap, int) or _provider_output_cap <= 0:
+        _provider_output_cap = entry.get("max_tokens")
+    if isinstance(_provider_output_cap, int) and _provider_output_cap > 0:
+        normalized["max_output_tokens"] = _provider_output_cap
 
     extra_body = entry.get("extra_body")
     if isinstance(extra_body, dict):

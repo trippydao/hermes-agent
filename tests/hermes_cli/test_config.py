@@ -944,6 +944,48 @@ class TestCustomProviderCompatibility:
             }
         ]
 
+    def test_compatible_custom_providers_preserves_max_output_tokens(self, tmp_path):
+        """Per-provider output cap survives the normalizer (gh-55 layer 1).
+
+        Before the fix, ``_normalize_custom_provider_entry`` only copied
+        whitelisted keys onto the normalized dict, silently dropping a
+        ``custom_providers[].max_output_tokens`` / ``max_tokens`` cap. The
+        value is what the gateway maps to ``AIAgent.max_tokens`` at request
+        time; losing it meant Spark requests were never actually capped.
+        """
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "_config_version": 17,
+                    "custom_providers": [
+                        {
+                            "name": "spark",
+                            "base_url": "http://100.122.146.36:8001/v1",
+                            "key_env": "SPARK_API_KEY",
+                            "max_output_tokens": 8192,
+                        },
+                        {
+                            "name": "spark-alias",
+                            "base_url": "http://100.122.146.36:8888/v1",
+                            "key_env": "SPARK_API_KEY",
+                            "max_tokens": 4096,
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            compatible = get_compatible_custom_providers()
+
+        by_name = {e["name"]: e for e in compatible}
+        # Explicit max_output_tokens wins.
+        assert by_name["spark"]["max_output_tokens"] == 8192
+        # Legacy max_tokens alias is read and normalised to max_output_tokens.
+        assert by_name["spark-alias"]["max_output_tokens"] == 4096
+
 
 class TestInterimAssistantMessageConfig:
     """Test the explicit gateway interim-message config gate."""
