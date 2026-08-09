@@ -1897,9 +1897,21 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        #
+        # For the Spark endpoint, swap in the real /tokenize counter (cached
+        # per string) so the compression threshold — the exact figure the
+        # chars/4 heuristic undercounts (issue #55 Layer 2) — is exact.
+        _spark_count_fn = None
+        try:
+            from agent import spark_tokenizer
+            if spark_tokenizer.is_spark_endpoint(agent.base_url, agent.model):
+                _spark_count_fn = spark_tokenizer.make_counter(agent.base_url)
+        except Exception:
+            _spark_count_fn = None
+        approx_tokens = estimate_messages_tokens_rough(api_messages, count_fn=_spark_count_fn)
         request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            _estimate_tools_tokens_rough(agent.tools, count_fn=_spark_count_fn)
+            if agent.tools else 0
         )
         total_chars = approx_tokens * 4
 
@@ -4754,9 +4766,16 @@ def run_conversation(
                         # Hermes may add API-only content not present in persisted
                         # messages.  Use the smaller budget and apply a small
                         # safety margin.  Do not alter context_length.
-                        request_input_estimate = estimate_request_tokens_rough(
-                            api_messages, tools=agent.tools or None,
+                        # Prefer the real tokenizer count captured during
+                        # request build (Spark, issue #55 Layer 2); fall back
+                        # to the rough estimate for other providers.
+                        request_input_estimate = getattr(
+                            agent, "_last_spark_input_tokens", None
                         )
+                        if request_input_estimate is None:
+                            request_input_estimate = estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None,
+                            )
                         local_available_out = old_ctx - request_input_estimate
                         if local_available_out > 0:
                             safe_out = max(1, min(available_out, local_available_out) - 64)

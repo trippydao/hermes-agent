@@ -1159,6 +1159,39 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     if tools_for_api is None:
         tools_for_api = agent.tools
 
+    # ── Spark (DGX DeepSeek) proactive output budget — issue #55 ──────
+    # Count the actual request with the endpoint's real tokenizer and cap the
+    # output (max_tokens) to ``context_length - actual_input - SAFETY_BUFFER``
+    # BEFORE the request, so a request can never exceed the model window and
+    # drive the compression-recovery loop into repeated provider 400s
+    # (Layer 3). The accurate count is also stashed so the reactive retry in
+    # conversation_loop prefers it over the chars/4 estimate (Layer 2).
+    _spark_budget = None
+    _is_spark = False
+    try:
+        from agent import spark_tokenizer
+        if spark_tokenizer.is_spark_endpoint(agent.base_url, agent.model):
+            _is_spark = True
+            from agent.model_metadata import estimate_request_tokens_rough as _ert
+            _real_input = int(
+                _ert(api_messages, tools=tools_for_api,
+                     count_fn=spark_tokenizer.make_counter(agent.base_url))
+            )
+            agent._last_spark_input_tokens = _real_input  # Layer 2: for the retry path
+            _compressor = getattr(agent, "context_compressor", None)
+            _ctx = _compressor.context_length if _compressor is not None else 0
+            if _ctx and _ctx > 0:
+                _spark_budget = _ctx - _real_input - spark_tokenizer.SAFETY_BUFFER
+    except Exception:
+        _is_spark = False
+        _spark_budget = None
+    # The effective output cap for this request: the Spark safety budget when
+    # it is tight enough to matter, else the configured max_tokens. Never grows
+    # beyond the configured cap.
+    _effective_max_output = agent.max_tokens
+    if _is_spark and isinstance(_spark_budget, int) and _spark_budget > 0:
+        _effective_max_output = max(1, min(agent.max_tokens or _spark_budget, _spark_budget))
+
     if agent.api_mode == "anthropic_messages":
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
@@ -1358,7 +1391,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             tools=tools_for_api,
             base_url=agent.base_url,
             timeout=agent._resolved_api_call_timeout(),
-            max_tokens=agent.max_tokens,
+            max_tokens=_effective_max_output,
             ephemeral_max_output_tokens=_ephemeral_out,
             max_tokens_param_fn=agent._max_tokens_param,
             reasoning_config=agent.reasoning_config,
@@ -1390,7 +1423,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         tools=tools_for_api,
         base_url=agent.base_url,
         timeout=agent._resolved_api_call_timeout(),
-        max_tokens=agent.max_tokens,
+        max_tokens=_effective_max_output,
         ephemeral_max_output_tokens=_ephemeral_out,
         max_tokens_param_fn=agent._max_tokens_param,
         reasoning_config=agent.reasoning_config,
