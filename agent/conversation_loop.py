@@ -2154,21 +2154,29 @@ def run_conversation(
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
         #
-        # For the Spark endpoint, swap in the real /tokenize counter (cached
-        # per string) so the compression threshold — the exact figure the
-        # chars/4 heuristic undercounts (issue #55 Layer 2) — is exact.
-        _spark_count_fn = None
+        # For the Spark endpoint, swap in the real full-request /tokenize counter
+        # (cached per payload) so the compression threshold — the exact figure
+        # the chars/4 heuristic undercounts (issue #55 Layer 2) — is exact.
+        # A single full-request count (messages + tools + add_generation_prompt)
+        # is the only shape that matches vLLM's usage.prompt_tokens; per-message
+        # sums cannot reproduce the chat template.
+        _spark_request_counter = None
         try:
             from agent import spark_tokenizer
             if spark_tokenizer.is_spark_endpoint(agent.base_url, agent.model):
-                _spark_count_fn = spark_tokenizer.make_counter(agent.base_url)
+                _spark_request_counter = lambda _list, _tools=agent.tools: (
+                    spark_tokenizer.count_request(_list, tools=_tools,
+                                                 add_generation_prompt=True))
         except Exception:
-            _spark_count_fn = None
-        approx_tokens = estimate_messages_tokens_rough(api_messages, count_fn=_spark_count_fn)
-        request_pressure_tokens = approx_tokens + (
-            _estimate_tools_tokens_rough(agent.tools, count_fn=_spark_count_fn)
-            if agent.tools else 0
-        )
+            _spark_request_counter = None
+        if _spark_request_counter is not None:
+            request_pressure_tokens = int(_spark_request_counter(api_messages))
+            approx_tokens = request_pressure_tokens
+        else:
+            approx_tokens = estimate_messages_tokens_rough(api_messages)
+            request_pressure_tokens = approx_tokens + (
+                _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
+            )
         total_chars = approx_tokens * 4
         # Stash this request's rough estimate so update_from_response() can
         # pair it with the provider's real prompt count — the (rough, real)
