@@ -433,6 +433,7 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 |---|---|---|
 | `auto_decompose` | `true` | 调度器每 tick 为 Triage 任务运行内置分解器；它不会限制配置文件驱动的 `kanban_create` 或创建者唤醒回合。 |
 | `auto_decompose_per_tick` | `3` | 每个调度器 tick 的分解上限。超出部分推迟到下一个 tick。 |
+| `auto_decompose_require_approval` | `false` | 为 `true` 时，自动分解仍会构建子任务图但将子任务保持为 `todo`，直到人工运行 `hermes kanban approve <id>` —— 未经批准不会启动任何 worker。自动扇出的人工把关。 |
 | `orchestrator_profile` | `""` | 拥有分解权的配置文件。空 = 回退到活动默认配置文件。 |
 | `default_assignee` | `""` | LLM 选择未知配置文件时子任务的落地位置。空 = 回退到活动默认配置文件。 |
 | `auto_subscribe_on_create` | `true` | 当 `kanban_create` 在持久 gateway/TUI 会话中运行时，终止事件会通过合成状态回合恢复原始 agent。设为 `false` 可让完成保持被动，或要求显式调用 `kanban_notify-subscribe`。此设置独立于 `auto_decompose`。 |
