@@ -66,33 +66,19 @@ def _resolve_requests_verify() -> bool | str:
             return val
     return True
 
-# Provider names that can appear as a "provider:" prefix before a model ID.
-# Only these are stripped — Ollama-style "model:tag" colons (e.g. "qwen3.5:27b")
-# are preserved so the full model name reaches cache lookups and server queries.
-_PROVIDER_PREFIXES: frozenset[str] = frozenset({
-    "openrouter", "nous", "openai-codex", "copilot", "copilot-acp",
-    "gemini", "ollama-cloud", "zai", "kimi-coding", "kimi-coding-cn", "stepfun", "minimax", "minimax-oauth", "minimax-cn", "anthropic", "deepseek", "deepinfra",
-    "opencode-zen", "opencode-go", "ai-gateway", "kilocode", "alibaba", "novita",
-    "qwen-oauth",
-    "xiaomi",
-    "arcee",
-    "gmi",
-    "tencent-tokenhub",
-    "custom", "local",
-    # Common aliases
-    "google", "google-gemini", "google-ai-studio",
-    "glm", "z-ai", "z.ai", "zhipu", "github", "github-copilot",
-    "github-models", "kimi", "moonshot", "kimi-cn", "moonshot-cn", "claude", "deep-seek", "deep-infra",
-    "ollama",
-    "stepfun", "opencode", "zen", "go", "vercel", "kilo", "dashscope", "aliyun", "qwen",
-    "mimo", "xiaomi-mimo",
-    "tencent", "tokenhub", "tencent-cloud", "tencentmaas",
-    "arcee-ai", "arceeai",
-    "gmi-cloud", "gmicloud",
-    "xai", "x-ai", "x.ai", "grok",
-    "nvidia", "nim", "nvidia-nim", "nemotron",
-    "qwen-portal", "novita-ai", "novitaai",
-})
+# Compatibility snapshot for callers that inspect this private constant.
+# Prefix routing below queries the registry live so later registrations work.
+try:
+    from providers import list_providers as _list_providers
+except Exception:
+    def _list_providers():
+        return []
+
+_PROVIDER_PREFIXES: frozenset[str] = frozenset(
+    value.lower()
+    for profile in _list_providers()
+    for value in (profile.name, *profile.aliases)
+)
 
 
 _OLLAMA_TAG_PATTERN = re.compile(
@@ -111,6 +97,9 @@ _TAILSCALE_CGNAT = ipaddress.IPv4Network("100.64.0.0/10")
 def _strip_provider_prefix(model: str) -> str:
     """Strip a recognised provider prefix from a model string.
 
+    Provider names and aliases come from the provider-profile registry, so
+    bundled and user plugins are recognised without a core catalog update.
+
     ``"local:my-model"`` → ``"my-model"``
     ``"qwen3.5:27b"``   → ``"qwen3.5:27b"``  (unchanged — not a provider prefix)
     ``"qwen:0.5b"``     → ``"qwen:0.5b"``    (unchanged — Ollama model:tag)
@@ -120,7 +109,13 @@ def _strip_provider_prefix(model: str) -> str:
         return model
     prefix, suffix = model.split(":", 1)
     prefix_lower = prefix.strip().lower()
-    if prefix_lower in _PROVIDER_PREFIXES:
+    try:
+        from providers import get_provider_profile
+
+        is_provider = get_provider_profile(prefix_lower) is not None
+    except Exception:
+        is_provider = False
+    if is_provider:
         # Don't strip if suffix looks like an Ollama tag (e.g. "7b", "latest", "q4_0")
         if _OLLAMA_TAG_PATTERN.match(suffix.strip()):
             return model
@@ -704,7 +699,6 @@ _URL_TO_PROVIDER: Dict[str, str] = {
 # Auto-extend with hostnames derived from provider profiles.
 # Any provider with a base_url not already in the map gets added automatically.
 try:
-    from providers import list_providers as _list_providers
     for _pp in _list_providers():
         _host = _pp.get_hostname()
         if _host and _host not in _URL_TO_PROVIDER:
@@ -3037,7 +3031,7 @@ _CJK_DENSE_RE = re.compile(
 )
 
 
-def estimate_tokens_rough(text: str, *, count_fn=None) -> int:
+def estimate_tokens_rough(text: str) -> int:
     """Rough token estimate for pre-flight checks.
 
     Uses ceiling division so short texts (1-3 chars) never estimate as
@@ -3047,23 +3041,12 @@ def estimate_tokens_rough(text: str, *, count_fn=None) -> int:
     tokenizers, so count those codepoints as roughly one token each instead
     of applying the English-centric ~4 chars/token rule.
 
-    ``count_fn`` optionally supplies a real tokenizer (e.g. the Spark vLLM
-    ``/tokenize`` — see ``agent.spark_tokenizer``) so endpoint-specific
-    estimates are exact. When provided it wins; any error falls through to
-    the cheap heuristic so a tokenizer outage can't wedge the hot path.
-    (Issue #55 Layer 2.)
-
     Perf: this runs on every message in every preflight/compaction walk,
     including MB-scale tool outputs, so the common all-ASCII case must stay
     O(1).  ``str.isascii()`` is a flag check on CPython's compact unicode
     representation (no scan), and the CJK counting itself is a single
     C-level ``re.findall`` rather than a per-character Python loop.
     """
-    if count_fn is not None:
-        try:
-            return int(count_fn(text))
-        except Exception:
-            pass  # fall through to the heuristic
     if not text:
         return 0
     text = str(text)
@@ -3079,7 +3062,7 @@ def estimate_tokens_rough(text: str, *, count_fn=None) -> int:
     return dense + ((sparse + 3) // 4)
 
 
-def estimate_messages_tokens_rough(messages: List[Dict[str, Any]], *, count_fn=None) -> int:
+def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     """Rough token estimate for a message list (pre-flight only).
 
     Image parts (base64 PNG/JPEG) are counted as a flat ~1500 tokens per
@@ -3096,7 +3079,7 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]], *, count_fn=N
     _IMAGE_TOKEN_COST = 1500
     total = 0
     for msg in messages:
-        total += _estimate_message_tokens_cached(msg, _IMAGE_TOKEN_COST, count_fn=count_fn)
+        total += _estimate_message_tokens_cached(msg, _IMAGE_TOKEN_COST)
     return total
 
 
@@ -3148,16 +3131,7 @@ def _msg_fingerprint(value: Any, pins: list) -> Any:
     raise ValueError("unfingerprintable message value")
 
 
-def _estimate_message_tokens_cached(msg: Any, image_cost: int, *, count_fn=None) -> int:
-    # When a real tokenizer is supplied (Spark endpoint) compute fresh and
-    # bypass the memo: the memo is keyed on the message shape only, and the
-    # network-backed count is per-endpoint-sensitive. It is rare enough (one
-    # call per request on the Spark path) that skipping the cache is free.
-    if count_fn is not None:
-        return (
-            _estimate_message_tokens_without_images(msg, count_fn=count_fn)
-            + _count_image_tokens(msg, image_cost)
-        )
+def _estimate_message_tokens_cached(msg: Any, image_cost: int) -> int:
     try:
         pins: list = []
         key = _msg_fingerprint(msg, pins)
@@ -3282,11 +3256,11 @@ def _estimate_message_chars(msg: Dict[str, Any]) -> int:
     return len(str(_wire_message_shadow(msg)))
 
 
-def _estimate_message_tokens_without_images(msg: Dict[str, Any], *, count_fn=None) -> int:
+def _estimate_message_tokens_without_images(msg: Dict[str, Any]) -> int:
     """Token estimate for a message shadow with image payloads stripped."""
     if not isinstance(msg, dict):
-        return estimate_tokens_rough(str(msg), count_fn=count_fn)
-    return estimate_tokens_rough(str(_wire_message_shadow(msg)), count_fn=count_fn)
+        return estimate_tokens_rough(str(msg))
+    return estimate_tokens_rough(str(_wire_message_shadow(msg)))
 
 
 def estimate_request_tokens_rough(
@@ -3294,7 +3268,6 @@ def estimate_request_tokens_rough(
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
-    count_fn=None,
 ) -> int:
     """Rough token estimate for a full chat-completions request.
 
@@ -3303,18 +3276,14 @@ def estimate_request_tokens_rough(
     tools enabled, schemas alone can add 20-30K tokens — a significant
     blind spot when only counting messages. Image content is counted
     at a flat per-image cost (see estimate_messages_tokens_rough).
-
-    ``count_fn`` swaps in a real tokenizer for the endpoint (Spark only —
-    see ``agent.spark_tokenizer``) so the input count is exact before any
-    ``context_length - input - buffer`` output-cap computation (issue #55).
     """
     total = 0
     if system_prompt:
-        total += estimate_tokens_rough(system_prompt, count_fn=count_fn)
+        total += estimate_tokens_rough(system_prompt)
     if messages:
-        total += estimate_messages_tokens_rough(messages, count_fn=count_fn)
+        total += estimate_messages_tokens_rough(messages)
     if tools:
-        total += _estimate_tools_tokens_rough(tools, count_fn=count_fn)
+        total += _estimate_tools_tokens_rough(tools)
     return total
 
 
@@ -3341,21 +3310,9 @@ def _tool_name_for_cache(tool: Any) -> str:
     return name if isinstance(name, str) else ""
 
 
-def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]], *, count_fn=None) -> int:
+def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
     if not tools:
         return 0
-
-    if count_fn is not None:
-        # Real tokenizer (Spark): count each tool's wire‑serialized schema.
-        # Descriptions + nested parameters dominate, so JSON is the faithful
-        # over-the-wire shape. Cache is not used here — tool lists are stable
-        # and spark_tokenizer already caches per string under the hood.
-        total = 0
-        for tool in tools:
-            if not isinstance(tool, dict):
-                continue
-            total += int(count_fn(json.dumps(tool, ensure_ascii=False, separators=(",", ":"))))
-        return total
 
     # Cache by list identity. Tools are rebuilt rarely (toolset changes),
     # but token estimates are requested frequently (preflight, compaction).
