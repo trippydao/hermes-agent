@@ -406,6 +406,8 @@ hermes dashboard        # 导航栏中出现 "Kanban" 标签页，位于 "Skills
 | `auto_decompose` | `true` | 调度器每 tick 自动运行分解器。 |
 | `auto_decompose_per_tick` | `3` | 每个调度器 tick 的分解上限。超出部分推迟到下一个 tick。 |
 | `auto_decompose_require_approval` | `false` | 为 `true` 时，自动分解仍会构建子任务图但将子任务保持为 `todo`，直到人工运行 `hermes kanban approve <id>` —— 未经批准不会启动任何 worker。自动扇出的人工把关。 |
+| `decompose_ignore_liveness` | `false` | 为 `true` 时，分解器跳过存活模型探测，直接发出所有子任务分支（无论目标模型是否实际在服务）。全局关闭存活门控。 |
+| `decompose_ignore_liveness_base_urls` | `[]` | 存活门控的按端点退出名单。列出 `base_url`（如 `http://100.122.146.36:8888/v1`），这些端点的模型无需探测即视为存活。忽略尾部斜杠。 |
 | `orchestrator_profile` | `""` | 拥有分解权的配置文件。空 = 回退到活动默认配置文件。 |
 | `default_assignee` | `""` | LLM 选择未知配置文件时子任务的落地位置。空 = 回退到活动默认配置文件。 |
 | `auto_subscribe_on_create` | `true` | 当 worker 在具有持久投递通道的会话（消息网关或 TUI）内调用 `kanban_create` 时，原始会话会自动订阅新任务的完成/阻塞事件。调度器仍负责驱动投递 —— 此设置只决定调用者的聊天/密钥是否出现在通知订阅表中。设为 `false` 则要求对每个任务显式调用 `kanban_notify-subscribe`。 |
