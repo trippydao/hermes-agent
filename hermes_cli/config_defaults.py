@@ -2376,6 +2376,20 @@ DEFAULT_CONFIG = {
         # `hermes kanban approve <id>` (alias of promote). Default false:
         # auto-decompose behaves as before (decompose -> ready -> run).
         "auto_decompose_require_approval": False,
+        # Liveness gate for decomposition (gh-78). Before writing children,
+        # the decomposer probes each profile's custom_providers base_url
+        # (GET /v1/models) and skips/flag legs whose model isn't actually
+        # served, so it never spawns a worker that can only fail. Set
+        # decompose_ignore_liveness to true to disable that probe entirely
+        # (decompose always proceeds, as before this feature). Default
+        # false: the liveness check runs.
+        "decompose_ignore_liveness": False,
+        # Per-endpoint opt-out for the liveness gate. A list of base_urls
+        # (e.g. "http://100.122.146.36:8888/v1") whose models are treated as
+        # live WITHOUT probing — useful for endpoints that are slow to
+        # enumerate or that you know are up. Trailing slashes are ignored.
+        # Empty by default: every endpoint is probed.
+        "decompose_ignore_liveness_base_urls": [],
         # Stale detection: running tasks that have exceeded this many
         # seconds without a heartbeat (since ``last_heartbeat_at``) are
         # auto-reclaimed to ``ready`` on the next dispatcher tick. The
