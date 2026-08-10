@@ -1905,14 +1905,17 @@ def run_conversation(
         # is the only shape that matches vLLM's usage.prompt_tokens; per-message
         # sums cannot reproduce the chat template.
         _spark_request_counter = None
+        _spark_safety_buffer = 0
         try:
             from agent import spark_tokenizer
             if spark_tokenizer.is_spark_endpoint(agent.base_url, agent.model):
+                _spark_safety_buffer = spark_tokenizer.SAFETY_BUFFER
                 _spark_request_counter = lambda _list, _tools=agent.tools: (
                     spark_tokenizer.count_request(_list, tools=_tools,
                                                  add_generation_prompt=True))
         except Exception:
             _spark_request_counter = None
+            _spark_safety_buffer = 0
         if _spark_request_counter is not None:
             request_pressure_tokens = int(_spark_request_counter(api_messages))
             approx_tokens = request_pressure_tokens
@@ -1995,14 +1998,44 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        # ── Pre-emptive ceiling fail ── issue #55 Layer 3. ─────────────
+        # The spark /tokenize count above (request_pressure_tokens) is the
+        # EXACT input shape the provider will render — not the chars/4 heuristic
+        # that undercounts tool-laden payloads. When input already sits within
+        # the SAFETY_BUFFER of context_length, the request CANNOT fit: any
+        # max_tokens is impossible and the provider would 400, kicking the
+        # reactive overflow-recovery loop. Compress BEFORE sending instead,
+        # bypassing only the SOFT preflight gates (defer-heuristic / summary-LLM
+        # cooldown) that exist to avoid pointless compaction of requests that
+        # would have fit anyway — an exact ceiling breach is authoritative, so
+        # those heuristics must not let an impossible request reach the wire.
+        # The hard backstops above (compression_enabled, attempts budget,
+        # preflight-blocked when a prior pass made no progress) still apply.
+        _spark_imminent_ceiling = False
+        if _spark_request_counter is not None:
+            _spark_ctx = int(getattr(_compressor, "context_length", 0) or 0)
+            if _spark_ctx > 0 and request_pressure_tokens + _spark_safety_buffer >= _spark_ctx:
+                _spark_imminent_ceiling = True
+                logger.warning(
+                    "Spark request at context ceiling: ~%s input + %s safety buffer "
+                    ">= %s context; compressing before send (issue #55)",
+                    f"{request_pressure_tokens:,}",
+                    _spark_safety_buffer,
+                    f"{_spark_ctx:,}",
+                )
         if (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
-            and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and (
+                _spark_imminent_ceiling
+                or (
+                    not _defer_preflight(request_pressure_tokens)
+                    and not _compression_cooldown
+                    and _compressor.should_compress(request_pressure_tokens)
+                )
+            )
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
